@@ -255,6 +255,7 @@ def train(local_rank, global_rank, world_size, args):
             tb_writer.add_scalar('test/accuracy', test_acc, epoch)
             tb_writer.add_scalar('train/learning_rate', current_lr, epoch)
             tb_writer.add_scalar('train/epoch_time', epoch_time, epoch)
+            tb_writer.add_scalar('train/world_size', world_size, epoch)
 
             # 记录模型参数直方图
             for name, param in model.named_parameters():
