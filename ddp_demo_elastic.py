@@ -84,7 +84,7 @@ def get_data_loaders(rank, world_size, batch_size=128):
         drop_last=False
     )
 
-    # 测试集不需要分布式采样器
+    # 测试集不需要分布式采样器，但在多节点环境中应该在每个节点上都有一份完整的测试集
     test_loader = DataLoader(
         test_dataset,
         batch_size=batch_size,
@@ -126,18 +126,22 @@ def evaluate(model, test_loader, criterion, device, rank, world_size):
 
 
 # 4. 训练函数 - 添加检查点保存和恢复功能
-def train(rank, world_size, args):
+def train(local_rank, global_rank, world_size, args):
     # 创建检查点目录
     workdir = args.workdir
     os.makedirs(workdir, exist_ok=True)
 
-    # 设置TensorBoard
-    if rank == 0:
+    # 设置TensorBoard - 只在全局主进程上创建
+    if global_rank == 0:
         tb_writer = SummaryWriter(workdir)
         print(f"TensorBoard logs will be saved to: {workdir!r}")
 
     # 设置设备
-    device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        device = torch.device(f"cuda:{local_rank}")
+        torch.cuda.set_device(local_rank)
+    else:
+        device = torch.device("cpu")
 
     # 创建模型并移动到设备
     model = CIFAR100Model().to(device)
@@ -149,8 +153,8 @@ def train(rank, world_size, args):
     # 学习率调度器
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
-    # 获取数据加载器
-    train_loader, test_loader, train_sampler = get_data_loaders(rank, world_size, args.batch_size)
+    # 获取数据加载器 - 使用全局rank确保数据分片正确
+    train_loader, test_loader, train_sampler = get_data_loaders(global_rank, world_size, args.batch_size)
 
     # 记录最佳准确率，用于保存最佳模型
     best_acc = 0.0
@@ -163,10 +167,14 @@ def train(rank, world_size, args):
     # 恢复检查点（如果存在）
     start_epoch = 0
     if os.path.exists(checkpoint_path):
-        if rank == 0:
+        if global_rank == 0:
             print(f"Loading checkpoint from {checkpoint_path}")
 
-        map_location = {'cuda:%d' % 0: 'cuda:%d' % rank}
+        # 确保所有进程都等待主进程加载检查点
+        dist.barrier()
+
+        # 将检查点加载到正确的设备
+        map_location = {'cuda:%d' % 0: 'cuda:%d' % local_rank}
         checkpoint = torch.load(checkpoint_path, map_location=map_location)
 
         model.load_state_dict(checkpoint['model'])
@@ -175,17 +183,21 @@ def train(rank, world_size, args):
         start_epoch = checkpoint['epoch'] + 1
         best_acc = checkpoint['best_acc']
 
-        if rank == 0:
+        if global_rank == 0:
             print(f"Resuming from epoch {start_epoch}, best accuracy: {best_acc:.2f}%")
 
+    # 确保所有进程都加载了检查点
+    dist.barrier()
+
     # 将模型包装为DDP模型 - 在加载检查点后进行
-    model = DDP(model, device_ids=[rank] if torch.cuda.is_available() else None)
+    # 使用local_rank作为device_ids，确保每个进程使用正确的GPU
+    model = DDP(model, device_ids=[local_rank] if torch.cuda.is_available() else None)
 
     # 训练循环
     for epoch in range(start_epoch, args.epochs):
         start_time = time.time()
 
-        # 设置采样器的epoch
+        # 设置采样器的epoch - 确保不同节点的进程获得不同的数据分片
         train_sampler.set_epoch(epoch)
 
         model.train()
@@ -213,8 +225,9 @@ def train(rank, world_size, args):
             total += targets.size(0)
             correct += predicted.eq(targets).sum().item()
 
+        # 模拟随机故障以测试恢复能力
         if random.random() < args.fuck_ratio:
-            raise RuntimeError('Fucked up')
+            raise RuntimeError(f'Process {global_rank} on node {socket.gethostname()} failed randomly')
 
         # 收集所有进程的训练结果
         train_metrics = torch.tensor([train_loss, correct, total], dtype=torch.float32, device=device)
@@ -225,7 +238,7 @@ def train(rank, world_size, args):
         global_train_acc = train_metrics[1].item() / train_metrics[2].item() * 100
 
         # 评估模型
-        test_loss, test_acc = evaluate(model, test_loader, criterion, device, rank, world_size)
+        test_loss, test_acc = evaluate(model, test_loader, criterion, device, global_rank, world_size)
 
         # 更新学习率
         current_lr = scheduler.get_last_lr()[0]
@@ -234,8 +247,8 @@ def train(rank, world_size, args):
         # 计算epoch时间
         epoch_time = time.time() - start_time
 
-        # 记录TensorBoard日志（仅主进程）
-        if rank == 0:
+        # 记录TensorBoard日志（仅全局主进程）
+        if global_rank == 0:
             tb_writer.add_scalar('train/loss', global_train_loss, epoch)
             tb_writer.add_scalar('test/loss', test_loss, epoch)
             tb_writer.add_scalar('train/accuracy', global_train_acc, epoch)
@@ -260,7 +273,12 @@ def train(rank, world_size, args):
                 torch.save(model.module.state_dict(), best_model_path)
                 print(f"Best model saved with accuracy: {best_acc:.2f}%")
 
-        # 保存检查点 - 所有进程都需要更新，但只有rank 0写入文件
+        # 在所有进程中同步最佳准确率
+        best_acc_tensor = torch.tensor([best_acc], device=device)
+        dist.broadcast(best_acc_tensor, src=0)
+        best_acc = best_acc_tensor.item()
+
+        # 保存检查点 - 所有进程都需要更新，但只有全局主进程写入文件
         checkpoint = {
             'epoch': epoch,
             'model': model.module.state_dict(),
@@ -270,19 +288,22 @@ def train(rank, world_size, args):
         }
 
         # 使用临时文件和原子写入确保检查点文件的完整性
-        if rank == 0:
+        if global_rank == 0:
             with tempfile.NamedTemporaryFile(dir=workdir, delete=False) as f:
                 torch.save(checkpoint, f.name)
                 os.replace(f.name, checkpoint_path)
 
-        # 同步所有进程
+        # 同步所有进程，确保检查点保存完成
         dist.barrier()
 
-    # 保存最终模型（仅主进程）
-    if rank == 0:
+    # 保存最终模型（仅全局主进程）
+    if global_rank == 0:
         torch.save(model.module.state_dict(), final_model_path)
         print(f"Training completed. Final model saved to {final_model_path}")
         tb_writer.close()
+
+    # 最终同步所有进程
+    dist.barrier()
 
 
 # 使用 PyTorch Elastic 的入口点函数
@@ -302,8 +323,11 @@ def main():
     global_rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
 
-    # 打印节点信息
+    # 获取节点信息
     hostname = socket.gethostname()
+    local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", 1))
+    node_rank = global_rank // local_world_size
+
     print(f"Initializing process {global_rank}/{world_size} on {hostname}, local rank: {local_rank}")
 
     # 初始化进程组
