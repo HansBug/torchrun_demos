@@ -213,7 +213,7 @@ def train(rank, world_size, args):
             total += targets.size(0)
             correct += predicted.eq(targets).sum().item()
 
-        if random.random() < 0.1:
+        if random.random() < args.fuck_ratio:
             raise RuntimeError('Fucked up')
 
         # 收集所有进程的训练结果
@@ -294,6 +294,7 @@ def main():
     parser.add_argument('--lr', type=float, default=0.1, help='learning rate')
     parser.add_argument('--workdir', type=str, required=True, help='working directory')
     parser.add_argument('--backend', type=str, default='nccl', help='distributed backend')
+    parser.add_argument('--fuck-ratio', type=float, default=0.01, help='Ratio for fucking up (test the resume ability)')
     args = parser.parse_args()
 
     # PyTorch Elastic 设置环境变量
