@@ -1,5 +1,6 @@
 import argparse
 import os
+import random
 import socket
 import tempfile
 import time
@@ -211,6 +212,9 @@ def train(rank, world_size, args):
             _, predicted = outputs.max(1)
             total += targets.size(0)
             correct += predicted.eq(targets).sum().item()
+        
+        if random.random() < 0.1:
+            raise RuntimeError('Fucked up')
 
         # 收集所有进程的训练结果
         train_metrics = torch.tensor([train_loss, correct, total], dtype=torch.float32, device=device)
