@@ -126,12 +126,12 @@ def evaluate(model, test_loader, criterion, device, rank, world_size):
 
 # 4. 训练函数 - 添加检查点保存和恢复功能
 def train(rank, world_size, args):
+    # 创建检查点目录
+    workdir = args.workdir
+    os.makedirs(workdir, exist_ok=True)
+
     # 设置TensorBoard
     if rank == 0:
-        # 创建检查点目录
-        workdir = args.workdir
-        os.makedirs(workdir, exist_ok=True)
-
         tb_writer = SummaryWriter(workdir)
         print(f"TensorBoard logs will be saved to: {workdir!r}")
 
