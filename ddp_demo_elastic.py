@@ -328,24 +328,28 @@ def main():
     local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", 1))
     node_rank = global_rank // local_world_size
 
-    print(f"Initializing process {global_rank}/{world_size} on {hostname}, local rank: {local_rank}")
+    print(
+        f"Initializing process {global_rank}/{world_size} (local rank: {local_rank}) on node {hostname} (node rank: {node_rank})")
 
-    # 初始化进程组
-    dist.init_process_group(backend=args.backend)
+    # 初始化分布式环境
+    dist_url = os.environ.get("MASTER_ADDR", "localhost") + ":" + os.environ.get("MASTER_PORT", "29500")
 
-    # 设置当前设备
-    if torch.cuda.is_available():
-        torch.cuda.set_device(local_rank)
-        print(f"Process {global_rank} using GPU: {torch.cuda.get_device_name(local_rank)}")
+    if global_rank == 0:
+        print(f"Using distributed URL: {dist_url}")
+        print(f"World size: {world_size}, Backend: {args.backend}")
 
-    # 开始训练
+    dist.init_process_group(
+        backend=args.backend,
+        init_method="env://",
+        world_size=world_size,
+        rank=global_rank
+    )
+
+    # 训练模型
     try:
-        train(local_rank, world_size, args)
-    except Exception as e:
-        print(f"Error in rank {global_rank}: {e}")
-        raise e
+        train(local_rank, global_rank, world_size, args)
     finally:
-        # 清理
+        # 确保正确清理分布式环境
         dist.destroy_process_group()
 
 
