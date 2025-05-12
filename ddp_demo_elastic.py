@@ -212,7 +212,7 @@ def train(rank, world_size, args):
             _, predicted = outputs.max(1)
             total += targets.size(0)
             correct += predicted.eq(targets).sum().item()
-        
+
         if random.random() < 0.1:
             raise RuntimeError('Fucked up')
 
